@@ -10,7 +10,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,19 +33,10 @@ const (
 	defaultPingPeriod = (defaultPongWait * 9) / 10
 	// Time allowed for the initial handshake to complete.
 	defaultHandshakeTimeout = 30 * time.Second
-	// When the Charging Station is reconnecting, after a connection loss, it will use this variable for the amount of time
-	// it will double the previous back-off time. When the maximum number of increments is reached, the Charging
-	// Station keeps connecting with the same back-off time.
-	defaultRetryBackOffRepeatTimes = 5
-	// When the Charging Station is reconnecting, after a connection loss, it will use this variable as the maximum value
-	// for the random part of the back-off time. It will add a new random value to every increasing back-off time,
-	// including the first connection attempt (with this maximum), for the amount of times it will double the previous
-	// back-off time. When the maximum number of increments is reached, the Charging Station will keep connecting
-	// with the same back-off time.
-	defaultRetryBackOffRandomRange = 15 // seconds
-	// When the Charging Station is reconnecting, after a connection loss, it will use this variable as the minimum backoff
-	// time, the first time it tries to reconnect.
-	defaultRetryBackOffWaitMinimum = 10 * time.Second
+	// The base delay to be used for automatic reconnection. Will double for every attempt up to maxReconnectionDelay.
+	defaultReconnectBackoff = 5 * time.Second
+	// Default maximum reconnection delay for websockets
+	defaultReconnectMaxBackoff = 2 * time.Minute
 )
 
 // The internal verbose logger
@@ -69,15 +59,16 @@ func SetLogger(logger logging.Logger) {
 // To set a custom configuration, refer to the server's SetTimeoutConfig method.
 // If no configuration is passed, a default configuration is generated via the NewServerTimeoutConfig function.
 type ServerTimeoutConfig struct {
-	WriteWait time.Duration
-	PingWait  time.Duration
+	WriteWait  time.Duration
+	PingWait   time.Duration
+	PingPeriod time.Duration
 }
 
 // NewServerTimeoutConfig creates a default timeout configuration for a websocket endpoint.
 //
 // You may change fields arbitrarily and pass the struct to a SetTimeoutConfig method.
 func NewServerTimeoutConfig() ServerTimeoutConfig {
-	return ServerTimeoutConfig{WriteWait: defaultWriteWait, PingWait: defaultPingWait}
+	return ServerTimeoutConfig{WriteWait: defaultWriteWait, PingWait: defaultPingWait, PingPeriod: defaultPingPeriod}
 }
 
 // Config contains optional configuration parameters for a websocket client.
@@ -86,13 +77,12 @@ func NewServerTimeoutConfig() ServerTimeoutConfig {
 // To set a custom configuration, refer to the client's SetTimeoutConfig method.
 // If no configuration is passed, a default configuration is generated via the NewClientTimeoutConfig function.
 type ClientTimeoutConfig struct {
-	WriteWait               time.Duration
-	HandshakeTimeout        time.Duration
-	PongWait                time.Duration
-	PingPeriod              time.Duration
-	RetryBackOffRepeatTimes int
-	RetryBackOffRandomRange int
-	RetryBackOffWaitMinimum time.Duration
+	WriteWait           time.Duration
+	HandshakeTimeout    time.Duration
+	PongWait            time.Duration
+	PingPeriod          time.Duration
+	ReconnectBackoff    time.Duration
+	ReconnectMaxBackoff time.Duration
 }
 
 // NewClientTimeoutConfig creates a default timeout configuration for a websocket endpoint.
@@ -100,13 +90,12 @@ type ClientTimeoutConfig struct {
 // You may change fields arbitrarily and pass the struct to a SetTimeoutConfig method.
 func NewClientTimeoutConfig() ClientTimeoutConfig {
 	return ClientTimeoutConfig{
-		WriteWait:               defaultWriteWait,
-		HandshakeTimeout:        defaultHandshakeTimeout,
-		PongWait:                defaultPongWait,
-		PingPeriod:              defaultPingPeriod,
-		RetryBackOffRepeatTimes: defaultRetryBackOffRepeatTimes,
-		RetryBackOffRandomRange: defaultRetryBackOffRandomRange,
-		RetryBackOffWaitMinimum: defaultRetryBackOffWaitMinimum,
+		WriteWait:           defaultWriteWait,
+		HandshakeTimeout:    defaultHandshakeTimeout,
+		PongWait:            defaultPongWait,
+		PingPeriod:          defaultPingPeriod,
+		ReconnectBackoff:    defaultReconnectBackoff,
+		ReconnectMaxBackoff: defaultReconnectMaxBackoff,
 	}
 }
 
@@ -259,21 +248,22 @@ type WsServer interface {
 //
 // Use the NewServer or NewTLSServer functions to create a new server.
 type Server struct {
-	connections         map[string]*WebSocket
-	httpServer          *http.Server
-	messageHandler      func(ws Channel, data []byte) error
-	checkClientHandler  func(id string, r *http.Request) bool
-	newClientHandler    func(ws Channel)
-	disconnectedHandler func(ws Channel)
-	basicAuthHandler    func(username string, password string) bool
-	tlsCertificatePath  string
-	tlsCertificateKey   string
-	timeoutConfig       ServerTimeoutConfig
-	upgrader            websocket.Upgrader
-	errC                chan error
-	connMutex           sync.RWMutex
-	addr                *net.TCPAddr
-	httpHandler         *mux.Router
+	connections          map[string]*WebSocket
+	httpServer           *http.Server
+	messageHandler       func(ws Channel, data []byte) error
+	checkClientHandler   func(id string, r *http.Request) bool
+	upgradeFailedHandler func(id string)
+	newClientHandler     func(ws Channel)
+	disconnectedHandler  func(ws Channel)
+	basicAuthHandler     func(username string, password string) bool
+	tlsCertificatePath   string
+	tlsCertificateKey    string
+	timeoutConfig        ServerTimeoutConfig
+	upgrader             websocket.Upgrader
+	errC                 chan error
+	connMutex            sync.RWMutex
+	addr                 *net.TCPAddr
+	httpHandler          *mux.Router
 }
 
 // Creates a new simple websocket server (the websockets are not secured).
@@ -321,6 +311,10 @@ func (server *Server) SetMessageHandler(handler func(ws Channel, data []byte) er
 
 func (server *Server) SetCheckClientHandler(handler func(id string, r *http.Request) bool) {
 	server.checkClientHandler = handler
+}
+
+func (server *Server) SetUpgradeFailedHandler(handler func(id string)) {
+	server.upgradeFailedHandler = handler
 }
 
 func (server *Server) SetNewClientHandler(handler func(ws Channel)) {
@@ -376,10 +370,8 @@ func (server *Server) AddHttpHandler(listenPath string, handler func(w http.Resp
 }
 
 func (server *Server) Start(port int, listenPath string) {
-	server.connMutex.Lock()
-	server.connections = make(map[string]*WebSocket)
-	server.connMutex.Unlock()
 
+	server.connections = make(map[string]*WebSocket)
 	if server.httpServer == nil {
 		server.httpServer = &http.Server{}
 	}
@@ -442,16 +434,16 @@ func (server *Server) StopConnection(id string, closeError websocket.CloseError)
 }
 
 func (server *Server) stopConnections() {
-	server.connMutex.RLock()
-	defer server.connMutex.RUnlock()
+	server.connMutex.Lock()
+	defer server.connMutex.Unlock()
 	for _, conn := range server.connections {
 		conn.closeC <- websocket.CloseError{Code: websocket.CloseNormalClosure, Text: ""}
 	}
 }
 
 func (server *Server) Write(webSocketId string, data []byte) error {
-	server.connMutex.RLock()
-	defer server.connMutex.RUnlock()
+	server.connMutex.Lock()
+	defer server.connMutex.Unlock()
 	ws, ok := server.connections[webSocketId]
 	if !ok {
 		return fmt.Errorf("couldn't write to websocket. No socket with id %v is open", webSocketId)
@@ -514,6 +506,7 @@ out:
 	conn, err := server.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		server.error(fmt.Errorf("upgrade failed: %w", err))
+		server.upgradeFailedHandler(id)
 		return
 	}
 
@@ -535,6 +528,7 @@ out:
 			websocket.FormatCloseMessage(websocket.CloseProtocolError, "invalid or unsupported subprotocol"),
 			time.Now().Add(server.timeoutConfig.WriteWait))
 		_ = conn.Close()
+		server.upgradeFailedHandler(id)
 		return
 	}
 	// Check whether client exists
@@ -547,6 +541,8 @@ out:
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "a connection with this ID already exists"),
 			time.Now().Add(server.timeoutConfig.WriteWait))
 		_ = conn.Close()
+
+		server.upgradeFailedHandler(id)
 		return
 	}
 	// Add new client
@@ -570,6 +566,13 @@ func (server *Server) getReadTimeout() time.Time {
 
 func (server *Server) readPump(ws *WebSocket) {
 	conn := ws.connection
+
+	conn.SetPongHandler(func(string) error {
+		//fmt.Println(">recv pong")
+		log.Debugf("pong received from %s", ws.ID())
+		conn.SetReadDeadline(server.getReadTimeout())
+		return nil
+	})
 
 	conn.SetPingHandler(func(appData string) error {
 		log.Debugf("ping received from %s", ws.ID())
@@ -605,6 +608,12 @@ func (server *Server) readPump(ws *WebSocket) {
 
 func (server *Server) writePump(ws *WebSocket) {
 	conn := ws.connection
+
+	pingTicker := time.NewTicker(server.timeoutConfig.PingPeriod)
+	defer func() {
+		pingTicker.Stop()
+		conn.Close()
+	}()
 
 	for {
 		select {
@@ -648,6 +657,12 @@ func (server *Server) writePump(ws *WebSocket) {
 			// Invoking cleanup
 			server.cleanupConnection(ws)
 			return
+		case <-pingTicker.C:
+			conn.SetWriteDeadline(server.getReadTimeout())
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+			log.Debugf("ping sent to %s", ws.ID())
 		case closed, ok := <-ws.forceCloseC:
 			if !ok || closed != nil {
 				// Connection was forcefully closed, invoke cleanup
@@ -987,8 +1002,7 @@ func (client *Client) cleanup() {
 
 func (client *Client) handleReconnection() {
 	log.Info("started automatic reconnection handler")
-	delay := client.timeoutConfig.RetryBackOffWaitMinimum + time.Duration(rand.Intn(client.timeoutConfig.RetryBackOffRandomRange+1))*time.Second
-	reconnectionAttempts := 1
+	delay := client.timeoutConfig.ReconnectBackoff
 	for {
 		// Wait before reconnecting
 		select {
@@ -1007,13 +1021,11 @@ func (client *Client) handleReconnection() {
 			return
 		}
 		client.error(fmt.Errorf("reconnection failed: %w", err))
-
-		if reconnectionAttempts < client.timeoutConfig.RetryBackOffRepeatTimes {
-			// Re-connection failed, double the delay
-			delay *= 2
-			delay += time.Duration(rand.Intn(client.timeoutConfig.RetryBackOffRandomRange+1)) * time.Second
+		// Re-connection failed, double the delay
+		delay *= 2
+		if delay >= client.timeoutConfig.ReconnectMaxBackoff {
+			delay = client.timeoutConfig.ReconnectMaxBackoff
 		}
-		reconnectionAttempts += 1
 	}
 }
 
@@ -1084,7 +1096,7 @@ func (client *Client) Start(urlStr string) error {
 	log.Infof("connected to server as %s", id)
 	client.reconnectC = make(chan struct{})
 	client.setConnected(true)
-	// Start reader and write routine
+	//Start reader and write routine
 	go client.writePump()
 	go client.readPump()
 	return nil

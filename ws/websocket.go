@@ -522,7 +522,7 @@ out:
 	}
 	log.Debugf("upgraded websocket connection for %s from %s", id, conn.RemoteAddr().String())
 	// If unsupported subprotocol, terminate the connection immediately
-	if negotiatedSuprotocol == "" {
+	if negotiatedSuprotocol == "" && len(server.upgrader.Subprotocols) > 0 {
 		server.error(fmt.Errorf("unsupported subprotocols %v for new client %v (%v)", clientSubprotocols, id, r.RemoteAddr))
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseProtocolError, "invalid or unsupported subprotocol"),

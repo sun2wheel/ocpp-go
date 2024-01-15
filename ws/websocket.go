@@ -506,7 +506,9 @@ out:
 	conn, err := server.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		server.error(fmt.Errorf("upgrade failed: %w", err))
-		server.upgradeFailedHandler(id)
+		if server.upgradeFailedHandler != nil {
+			server.upgradeFailedHandler(id)
+		}
 		return
 	}
 
@@ -528,7 +530,9 @@ out:
 			websocket.FormatCloseMessage(websocket.CloseProtocolError, "invalid or unsupported subprotocol"),
 			time.Now().Add(server.timeoutConfig.WriteWait))
 		_ = conn.Close()
-		server.upgradeFailedHandler(id)
+		if server.upgradeFailedHandler != nil {
+			server.upgradeFailedHandler(id)
+		}
 		return
 	}
 	// Check whether client exists
@@ -542,7 +546,9 @@ out:
 			time.Now().Add(server.timeoutConfig.WriteWait))
 		_ = conn.Close()
 
-		server.upgradeFailedHandler(id)
+		if server.upgradeFailedHandler != nil {
+			server.upgradeFailedHandler(id)
+		}
 		return
 	}
 	// Add new client

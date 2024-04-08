@@ -680,6 +680,8 @@ func (server *Server) writePump(ws *WebSocket) {
 		case <-pingTicker.C:
 			conn.SetWriteDeadline(server.getReadTimeout())
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Infof("closed connection to %s", ws.ID())
+				server.cleanupConnection(ws)
 				return
 			}
 			log.Debugf("ping sent to %s", ws.ID())
